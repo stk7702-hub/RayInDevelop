@@ -3650,19 +3650,27 @@ function AutoBuy:_needsToBuy(itemName)
     if isArmor and character then
         local bodyEffects = character:FindFirstChild("BodyEffects")
         if bodyEffects then
+            local function getBodyEffectValue(effectName)
+                local effect = bodyEffects:FindFirstChild(effectName)
+                if not effect or not effect:IsA("ValueBase") then
+                    return nil
+                end
+                return tonumber(effect.Value)
+            end
+
             if itemName == "Fire Armor" then
-                local fireArmor = bodyEffects:FindFirstChild("FireArmor")
-                if fireArmor and fireArmor:IsA("NumberValue") and fireArmor.Value >= 200 then
+                local fireArmorValue = getBodyEffectValue("FireArmor")
+                if fireArmorValue and fireArmorValue >= 200 then
                     return false
                 end
             elseif itemName == "High-Medium Armor" then
-                local armor = bodyEffects:FindFirstChild("Armor")
-                if armor and armor:IsA("NumberValue") and armor.Value >= 130 then
+                local armorValue = getBodyEffectValue("Armor")
+                if armorValue and armorValue >= 130 then
                     return false
                 end
             elseif itemName == "Medium Armor" then
-                local armor = bodyEffects:FindFirstChild("Armor")
-                if armor and armor:IsA("NumberValue") and armor.Value >= 100 then
+                local armorValue = getBodyEffectValue("Armor")
+                if armorValue and armorValue >= 100 then
                     return false
                 end
             end
