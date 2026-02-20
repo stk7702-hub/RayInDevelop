@@ -320,7 +320,18 @@ function Util.CalculateCFrameSpeed(sliderValue)
 end
 
 function Util.IsUIBlocking()
-	if menuOpen then return true end
+	-- Проверяем, открыт ли интерфейс Fatality (самый надежный способ)
+	local isMenuOpen = false
+	if Fatality and Fatality.Windows then
+		for _, win in ipairs(Fatality.Windows) do
+			if win:IsA("ScreenGui") and win.Enabled then
+				isMenuOpen = true
+				break
+			end
+		end
+	end
+
+	if isMenuOpen then return true end
 	if Services.GuiService.MenuIsOpen then return true end
 	if Services.UserInputService:GetFocusedTextBox() ~= nil then return true end
 	return false
@@ -1041,25 +1052,40 @@ function ShootingService:PredictPosition(character, hitbox, options)
 	local rootPart = character:FindFirstChild("HumanoidRootPart")
 	if not rootPart then return hitbox.Position end
 
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
 	local ping = self._pingTracker:GetPing()
 	local t_net = (ping / 1000) / 2
 	local t_tick = CONSTANTS.SERVER_TICK / 2
 
 	local velocity, acceleration
-	local t_proj
 
-	if options.useResolver then
+	-- АНТИ-ДЕСИНК (Auto-Resolver): Проверяем, не телепортируется ли цель
+	local rawVel = rootPart.AssemblyLinearVelocity
+	local isDesyncing = rawVel.Magnitude > CONSTANTS.MAX_VELOCITY or (humanoid and humanoid.MoveDirection.Magnitude == 0 and rawVel.Magnitude > 15)
+
+	-- Если включен Resolver или мы обнаружили Десинк/Телепорт
+	if options.useResolver or isDesyncing then
+		-- Берем скорость только от кнопок ходьбы (WASD), игнорируем физические телепорты
 		velocity, acceleration = self._velocityTracker:GetSmoothedVelocity(character, true)
+		if isDesyncing then
+			-- При жестком десинке убираем акселерацию, чтобы предикшен не сходил с ума
+			acceleration = Vector3.zero
+			-- Если враг стоит на месте (MoveDirection = 0), но его физически кидает, стреляем ровно в центр
+			if velocity.Magnitude == 0 then
+				return hitbox.Position
+			end
+		end
 	elseif options.useSmoothedVelocity then
 		velocity, acceleration = self._velocityTracker:GetSmoothedVelocity(character, false)
 	else
-		velocity = rootPart.AssemblyLinearVelocity
+		velocity = rawVel
 		if velocity.Magnitude > CONSTANTS.MAX_VELOCITY then
 			velocity = velocity.Unit * CONSTANTS.MAX_VELOCITY
 		end
 		acceleration = Vector3.zero
 	end
 
+	local t_proj
 	if options.autoPrediction then
 		local speed = velocity.Magnitude
 		local autoDivisor = Util.GetAutoPredDivisor(speed)
@@ -1075,7 +1101,6 @@ function ShootingService:PredictPosition(character, hitbox, options)
 	local t_total = t_net + t_tick + t_proj
 	local yOffset = 0
 	if options.jumpOffset and options.jumpOffset ~= 0 then
-		local humanoid = character:FindFirstChildOfClass("Humanoid")
 		if humanoid then
 			local state = humanoid:GetState()
 			if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping then
@@ -1537,7 +1562,7 @@ function StateManager:IsRage()
 end
 
 -- ============================================================
--- CAMERA LOCK MODULE
+-- CAMERA LOCK MODULE (STICKY TARGET & MENU FIX)
 -- ============================================================
 
 local CameraLock = {}
@@ -1550,13 +1575,14 @@ function CameraLock.new(shootingService)
 	self.Smoothness = 0.1
 	self.Prediction = 0.1
 	self.CurrentTarget = nil
+	self.Stickiness = 1.3 -- Коэффициент "липкости" (1.3 = 130% от FOV для удержания)
 
 	self._shootingService = shootingService
 	self._connection = nil
 	self._lastTime = 0
 	self._getTargetFn = nil
 	self._hitboxFn = nil
-	self._visibleCheckFn = nil -- FIX: добавлен провайдер visibleCheck
+	self._visibleCheckFn = nil
 	return self
 end
 
@@ -1568,7 +1594,6 @@ function CameraLock:SetHitboxProvider(fn)
 	self._hitboxFn = fn
 end
 
--- FIX: новый метод для привязки к настройке VisibleCheck
 function CameraLock:SetVisibleCheckProvider(fn)
 	self._visibleCheckFn = fn
 end
@@ -1605,12 +1630,36 @@ function CameraLock:_calculateTargetCFrame(targetPosition)
 	return CFrame.lookAt(camPosition, targetPosition)
 end
 
+-- Функция проверки: валидна ли текущая цель для удержания
+function CameraLock:_isValidTarget(target, useVisCheck)
+	if not target or not target.Character then return false end
+	if not Util.IsCharacterAlive(target.Character) then return false end
+
+	local hitboxName = self._hitboxFn and self._hitboxFn() or "Head"
+	local hitbox = Util.GetHitboxPart(target.Character, hitboxName)
+	if not hitbox then return false end
+
+	-- Проверка расстояния с учетом липкости (Stickiness)
+	local dist = Util.GetDistanceFromCrosshair(hitbox.Position)
+	if dist > (self.FOV * self.Stickiness) then return false end
+
+	-- Проверка на стены, если включено
+	if useVisCheck and not Util.IsVisible(Camera.CFrame.Position, hitbox) then return false end
+
+	return true
+end
+
 function CameraLock:Start()
 	if self._connection then return end
 	self._lastTime = tick()
 
 	self._connection = Services.RunService.RenderStepped:Connect(function()
-		if not self.Active then return end
+		if not self.Active then
+			self.CurrentTarget = nil
+			return
+		end
+
+		-- Если UI открыт — полностью игнорируем наводку (позволяет спокойно крутить настройки)
 		if Util.IsUIBlocking() then
 			self.CurrentTarget = nil
 			return
@@ -1621,10 +1670,18 @@ function CameraLock:Start()
 		self._lastTime = currentTime
 
 		if not self._getTargetFn then return end
-		-- FIX: используем VisibleCheck провайдер
 		local useVisCheck = self._visibleCheckFn and self._visibleCheckFn() or false
-		local target = self._getTargetFn(self.FOV, useVisCheck, false)
-		self.CurrentTarget = target
+
+		-- ЛОГИКА ВЫБОРА ЦЕЛИ (Sticky Target)
+		-- Сначала проверяем, валидна ли еще старая цель. Если да — оставляем её.
+		if self.CurrentTarget and self:_isValidTarget(self.CurrentTarget, useVisCheck) then
+			-- Ничего не делаем, цель остается прежней
+		else
+			-- Ищем новую цель
+			self.CurrentTarget = self._getTargetFn(self.FOV, useVisCheck, false)
+		end
+
+		local target = self.CurrentTarget
 
 		if not target or not target.Character then return end
 
@@ -2268,7 +2325,14 @@ function RageBot:GetTarget()
 
 		local hitbox = Util.GetHitboxPart(char, self.Hitbox)
 		if not hitbox then continue end
-		if not Util.IsVisible(Camera.CFrame.Position, hitbox) then continue end
+
+		local targetRoot = char:FindFirstChild("HumanoidRootPart")
+		local isDesyncing = targetRoot and targetRoot.AssemblyLinearVelocity.Magnitude > 100
+
+		-- Для жесткого десинка игнорируем проверку стен (raycast может давать ложные промахи)
+		if not isDesyncing then
+			if not Util.IsVisible(Camera.CFrame.Position, hitbox) then continue end
+		end
 
 		local worldDist = Util.GetWorldDistance(myRoot.Position, hitbox.Position)
 		if worldDist > maxDistance then continue end
@@ -2791,8 +2855,20 @@ function Movement:StartJumpPower()
 	self.JumpPower.Connection = Services.RunService.RenderStepped:Connect(function()
 		if not self.JumpPower.Enabled then return end
 		local c, h = Util.GetCharacterParts()
-		if h and h.JumpPower ~= self.JumpPower.Value then
-			h.JumpPower = self.JumpPower.Value
+		if h then
+			-- Устанавливаем значение для старой системы
+			if h.JumpPower ~= self.JumpPower.Value then
+				h.JumpPower = self.JumpPower.Value
+			end
+
+			-- Вычисляем эквивалент для новой системы (JumpHeight) на которую переключает No Jump Cooldown
+			-- Формула Roblox: JumpHeight = (JumpPower^2) / (2 * Gravity)
+			local gravity = workspace.Gravity or 196.2
+			local equivalentHeight = (self.JumpPower.Value * self.JumpPower.Value) / (2 * gravity)
+
+			if h.JumpHeight ~= equivalentHeight then
+				h.JumpHeight = equivalentHeight
+			end
 		end
 	end)
 end
@@ -3265,9 +3341,19 @@ function CharacterModule:EnableNoSlow()
 			if humanoid.WalkSpeed < minSpeed then
 				humanoid.WalkSpeed = minSpeed
 			end
+
+			-- Проверяем старую систему прыжка
 			if humanoid.JumpPower < minJump then
 				humanoid.JumpPower = minJump
 			end
+
+			-- Защищаем новую систему прыжка (для работы вместе с No Jump Cooldown)
+			local gravity = workspace.Gravity or 196.2
+			local minJumpHeight = (minJump * minJump) / (2 * gravity)
+			if humanoid.JumpHeight < minJumpHeight then
+				humanoid.JumpHeight = minJumpHeight
+			end
+
 			if humanoid.PlatformStand and not (self._movement.Fly.Enabled and self._movement.Fly.Active) then
 				humanoid.PlatformStand = false
 			end
