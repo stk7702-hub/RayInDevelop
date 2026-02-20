@@ -5838,7 +5838,7 @@ local function UpdateSecurityExpiration(window)
 	end
 
 	if not expiry then
-		window:SetExpire("Dev Build")
+		window:SetExpire("?")
 		return
 	end
 
