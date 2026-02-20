@@ -5794,13 +5794,67 @@ local Window = Fatality.new({
 	Name = "RAY",
 	Keybind = Enum.KeyCode.Insert,
 	Scale = UDim2.new(0, 750, 0, 500),
-	Expire = "LifeTime",
+	Expire = "Loading...",
 	SidebarWidth = 200,
 	TabHeight = 40,
 	HeaderHeight = 50,
 	BottomHeight = 30,
 	Theme = ThemeConfig,
 })
+
+local function UpdateSecurityExpiration(window)
+	if not window then return end
+
+	local env = getgenv and getgenv() or _G
+	local candidates = {
+		env and env.PolsecData,
+		env and env.PolSec,
+		env and env.KeyInfo,
+		env and env.script_key_info,
+		env and env.ScriptKeyInfo,
+		env and env.Luarmor,
+	}
+
+	local keyData = nil
+	for _, data in ipairs(candidates) do
+		if type(data) == "table" then
+			keyData = data
+			break
+		end
+	end
+
+	if not keyData then
+		window:SetExpire("Dev Build")
+		return
+	end
+
+	local isLifetime = keyData.Lifetime or keyData.IsLifetime or keyData.lifetime or keyData.isLifetime
+	if isLifetime then
+		window:SetExpire("Lifetime")
+	else
+		local expiresAt = keyData.ExpiresAt or keyData.ExpireAt or keyData.Expiry or keyData.Expires or keyData.expires_at or keyData.expire
+		expiresAt = tonumber(expiresAt)
+
+		if expiresAt then
+			-- Some APIs provide milliseconds timestamp.
+			if expiresAt > 9999999999 then
+				expiresAt = math.floor(expiresAt / 1000)
+			end
+			window:SetExpire(os.date("%d.%m.%Y", expiresAt))
+		else
+			window:SetExpire("Unknown")
+		end
+	end
+
+	local username = keyData.Username or keyData.UserName or keyData.user or keyData.name or keyData.discord
+	if username then
+		window:SetUsername(tostring(username))
+	end
+end
+
+pcall(function()
+	UpdateSecurityExpiration(Window)
+end)
 
 if Window and Window.Signal then
 	Window.Signal.Event:Connect(function(isVisible)
