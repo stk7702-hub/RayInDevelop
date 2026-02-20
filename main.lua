@@ -382,6 +382,7 @@ function DesyncEngine:Start(fakePosition)
 
 	self._active = true
 	self._realCFrame = hrp.CFrame
+	self._realVelocity = hrp.AssemblyLinearVelocity -- Сохраняем реальную скорость
 
 	if typeof(fakePosition) == "CFrame" then
 		self._fakeCFrame = fakePosition
@@ -389,9 +390,7 @@ function DesyncEngine:Start(fakePosition)
 		self._fakeCFrame = CFrame.new(fakePosition) * (self._realCFrame - self._realCFrame.Position)
 	end
 
-	-- ЭТАП 1: BindToRenderStep с приоритетом First (самый первый в кадре)
-	-- Это выполняется ДО рендера — восстанавливаем реальную позицию
-	-- чтобы камера и рендер видели персонажа на месте
+	-- ЭТАП 1: RenderStepped - Возвращаем реальную позицию и скорость для нашего клиента
 	if not self._restoreBound then
 		Services.RunService:BindToRenderStep(self._bindName, Enum.RenderPriority.First.Value - 1, function()
 			if not self._active then return end
@@ -399,28 +398,30 @@ function DesyncEngine:Start(fakePosition)
 			local root = char and char:FindFirstChild("HumanoidRootPart")
 			if root and self._realCFrame then
 				root.CFrame = self._realCFrame
+				if self._realVelocity then
+					root.AssemblyLinearVelocity = self._realVelocity
+				end
 			end
 		end)
 		self._restoreBound = true
 	end
 
-	-- ЭТАП 2: Heartbeat — выполняется ПОСЛЕ физики, ПЕРЕД отправкой пакета
-	-- Здесь ставим фейковую позицию — сервер получит её
+	-- ЭТАП 2: Heartbeat - Отправляем на сервер фейковую позицию и СЛОМАННУЮ скорость
 	self._heartbeatConnection = Services.RunService.Heartbeat:Connect(function()
 		if not self._active then return end
 		local char = LocalPlayer.Character
 		local root = char and char:FindFirstChild("HumanoidRootPart")
 		if not root then return end
 
-		-- Сохраняем текущую реальную позицию (игрок мог двигаться)
 		self._realCFrame = root.CFrame
-		-- Подменяем на фейковую — это уйдёт серверу
+		self._realVelocity = root.AssemblyLinearVelocity
+
 		root.CFrame = self._fakeCFrame
+		-- Подменяем скорость: чужие аимботы будут стрелять в небо или под землю
+		root.AssemblyLinearVelocity = Vector3.new(math.random(-500, 500), math.random(50000, 99999), math.random(-500, 500))
 	end)
 
-	-- ЭТАП 3: Stepped — дополнительная страховка
-	-- Stepped выполняется перед физикой, после RenderStepped
-	-- Гарантируем что физика работает с реальной позицией
+	-- ЭТАП 3: Stepped
 	self._steppedConnection = Services.RunService.Stepped:Connect(function()
 		if not self._active then return end
 		local char = LocalPlayer.Character
@@ -484,15 +485,18 @@ function DesyncEngine:Stop()
 		self._steppedConnection = nil
 	end
 
-	-- Гарантируем возврат на реальную позицию
 	local char = LocalPlayer.Character
 	local root = char and char:FindFirstChild("HumanoidRootPart")
 	if root and self._realCFrame then
 		root.CFrame = self._realCFrame
+		if self._realVelocity then
+			root.AssemblyLinearVelocity = self._realVelocity
+		end
 	end
 
 	self._realCFrame = nil
 	self._fakeCFrame = nil
+	self._realVelocity = nil
 end
 
 function DesyncEngine:RunForFrames(fakePosition, frameCount, callback)
@@ -4927,15 +4931,21 @@ function PlayerSystem:_stopSpectateTarget()
 	if myHum then Camera.CameraSubject = myHum end
 end
 
--- НОВОЕ: Рассчитать фейковую позицию рядом с целью для desync
+-- НОВОЕ: Рассчитать фейковую позицию рядом с целью (Jitter Anti-Aim)
 function PlayerSystem:_calcFakePosition(targetCharacter)
 	local targetRoot = targetCharacter:FindFirstChild("HumanoidRootPart")
 	if not targetRoot then return nil end
 
-	-- Позиция максимально близко к цели для десинка (сзади и выше на 3-5 studs)
-	-- Сервер проверяет расстояние, поэтому SmartTeleport не нужен
-	local behind = -targetRoot.CFrame.LookVector
-	return targetRoot.Position + behind * 4 + Vector3.new(0, 2, 0)
+	-- Jitter: Генерируем случайный угол и высоту каждый кадр
+	local randomAngle = math.random() * math.pi * 2
+	local radius = math.random(3, 5) -- Достаточно близко для регистрации выстрелов
+	local randomHeight = math.random(1, 6) -- Прыгаем вверх-вниз
+
+	local offsetX = math.cos(randomAngle) * radius
+	local offsetZ = math.sin(randomAngle) * radius
+
+	-- Позиция телепортируется вокруг врага, делая попадание по тебе невозможным
+	return targetRoot.Position + Vector3.new(offsetX, randomHeight, offsetZ)
 end
 
 -- НОВОЕ: Рассчитать позицию для стомпа
@@ -5805,50 +5815,51 @@ local Window = Fatality.new({
 local function UpdateSecurityExpiration(window)
 	if not window then return end
 
-	local env = getgenv and getgenv() or _G
-	local candidates = {
-		env and env.PolsecData,
-		env and env.PolSec,
-		env and env.KeyInfo,
-		env and env.script_key_info,
-		env and env.ScriptKeyInfo,
-		env and env.Luarmor,
-	}
+	-- PolSec устанавливает переменные напрямую в окружение скрипта
+	local expiry   = PolSec_Expiry
+	local creation = PolSec_Creation
+	local userId   = PolSec_UserId
+	local note     = PolSec_Note
 
-	local keyData = nil
-	for _, data in ipairs(candidates) do
-		if type(data) == "table" then
-			keyData = data
-			break
-		end
+	-- Fallback: пробуем getgenv() / _G на случай если переменные там
+	if not expiry and not creation then
+		local env = getgenv and getgenv() or _G
+		expiry   = env.PolSec_Expiry
+		creation = env.PolSec_Creation
+		userId   = env.PolSec_UserId
+		note     = env.PolSec_Note
 	end
 
-	if not keyData then
+	if not expiry then
 		window:SetExpire("Dev Build")
 		return
 	end
 
-	local isLifetime = keyData.Lifetime or keyData.IsLifetime or keyData.lifetime or keyData.isLifetime
-	if isLifetime then
-		window:SetExpire("Lifetime")
-	else
-		local expiresAt = keyData.ExpiresAt or keyData.ExpireAt or keyData.Expiry or keyData.Expires or keyData.expires_at or keyData.expire
-		expiresAt = tonumber(expiresAt)
-
-		if expiresAt then
-			-- Some APIs provide milliseconds timestamp.
-			if expiresAt > 9999999999 then
-				expiresAt = math.floor(expiresAt / 1000)
-			end
-			window:SetExpire(os.date("%d.%m.%Y", expiresAt))
-		else
-			window:SetExpire("Unknown")
-		end
+	expiry = tonumber(expiry)
+	if not expiry then
+		window:SetExpire("Unknown")
+		return
 	end
 
-	local username = keyData.Username or keyData.UserName or keyData.user or keyData.name or keyData.discord
-	if username then
-		window:SetUsername(tostring(username))
+	-- expiry == 0 или дата дальше 2100-01-01 — lifetime
+	if expiry == 0 or expiry > 4102444800 then
+		window:SetExpire("Lifetime")
+	else
+		-- Корректируем если timestamp в миллисекундах
+		if expiry > 9999999999 then
+			expiry = math.floor(expiry / 1000)
+		end
+		window:SetExpire(os.date("%d.%m.%Y", expiry))
+	end
+
+	-- Username: PolSec даёт только Discord UserId, имя берём из Note
+	userId = tonumber(userId)
+	if userId and userId > 1 then
+		if note and note ~= "" then
+			window:SetUsername(tostring(note))
+		else
+			window:SetUsername("ID: " .. tostring(userId))
+		end
 	end
 end
 
