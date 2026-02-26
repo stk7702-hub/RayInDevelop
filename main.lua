@@ -1,3 +1,10 @@
+print("=== POLSEC TEST (top of script) ===")
+print("PolSec_Expiry:", PolSec_Expiry)
+print("PolSec_Creation:", PolSec_Creation)
+print("PolSec_UserId:", PolSec_UserId)
+print("PolSec_Note:", PolSec_Note)
+print("script_key:", script_key)
+
 local Fatality = loadstring(game:HttpGet("https://raw.githubusercontent.com/stk7702-hub/Uilibrary/refs/heads/main/library.lua"))()
 
 -- ============================================================
@@ -6077,7 +6084,7 @@ local function UpdateSecurityExpiration(window)
 	end
 
 	if not expiry then
-		window:SetExpire("Dev Build")
+		window:SetExpire("???")
 		return
 	end
 
