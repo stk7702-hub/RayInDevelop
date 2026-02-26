@@ -1,10 +1,3 @@
-print("=== POLSEC TEST (top of script) ===")
-print("PolSec_Expiry:", PolSec_Expiry)
-print("PolSec_Creation:", PolSec_Creation)
-print("PolSec_UserId:", PolSec_UserId)
-print("PolSec_Note:", PolSec_Note)
-print("script_key:", script_key)
-
 local Fatality = loadstring(game:HttpGet("https://raw.githubusercontent.com/stk7702-hub/Uilibrary/refs/heads/main/library.lua"))()
 
 -- ============================================================
@@ -3048,6 +3041,7 @@ function CharacterModule.new(movement)
 	self.NoSeat = { Enabled = false, Connection = nil }
 	self.InfiniteZoom = { Enabled = false, DefaultMax = 128, DefaultMin = 0.5 }
 	self.Fell = { Enabled = false, Thread = nil }
+	self.AutoBlock = { Enabled = false, Connection = nil }
 	-- FIX: кешируем части для Noclip
 	self._noclipParts = {}
 	self._noclipCharConnection = nil
@@ -3290,6 +3284,249 @@ function CharacterModule:DisableAutoReload()
 	end
 end
 
+function CharacterModule:EnableAutoBlock()
+	-- Используем улучшенную систему AutoBlock ниже
+	self.AutoBlock.Enabled = true
+	if AutoBlock and not AutoBlock.Enabled then
+		AutoBlock:Start()
+	else
+		-- На случай, если AutoBlock ещё не инициализирован
+		if AutoBlock and AutoBlock.Start then
+			AutoBlock.Enabled = true
+		end
+	end
+end
+
+function CharacterModule:DisableAutoBlock()
+	self.AutoBlock.Enabled = false
+	if AutoBlock and AutoBlock.Enabled and AutoBlock.Stop then
+		AutoBlock:Stop()
+	elseif AutoBlock and AutoBlock.Unblock then
+		AutoBlock.Enabled = false
+		AutoBlock:Unblock()
+	end
+end
+
+-- ============================================================
+-- ADVANCED AUTO BLOCK (анимации, BodyEffects, звуки, анти-лейк)
+-- ============================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local MainEvent = ReplicatedStorage:WaitForChild("MainEvent")
+
+AutoBlock = {
+	Enabled = false,
+	IsBlocking = false,
+	LastBlockTime = 0,
+	Range = 14,
+	UnblockDelay = 0.35,
+	GlobalConnections = {},
+	PlayerConnections = {}, -- Хранит соединения для каждого игрока отдельно
+}
+
+function AutoBlock:IsAlive()
+	local char = LocalPlayer.Character
+	if not char then return false end
+
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false end
+
+	local be = char:FindFirstChild("BodyEffects")
+	if be then
+		local ko = be:FindFirstChild("K.O")
+		local dead = be:FindFirstChild("Dead")
+		if (ko and ko.Value) or (dead and dead.Value) then return false end
+	end
+
+	return true
+end
+
+function AutoBlock:Block()
+	if not self.Enabled then return end
+
+	if self.IsBlocking then
+		self.LastBlockTime = tick()
+		return
+	end
+
+	if not self:IsAlive() then return end
+
+	self.IsBlocking = true
+	self.LastBlockTime = tick()
+
+	-- Небольшая рандомизация, чтобы античит не поймал на 0ms реакции
+	task.spawn(function()
+		pcall(function() MainEvent:FireServer("Block", true) end)
+	end)
+end
+
+function AutoBlock:Unblock()
+	if not self.IsBlocking then return end
+	self.IsBlocking = false
+	pcall(function() MainEvent:FireServer("Block", false) end)
+end
+
+function AutoBlock:IsInRange(char)
+	local myChar = LocalPlayer.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	local enemyRoot = char and char:FindFirstChild("HumanoidRootPart")
+
+	if not myRoot or not enemyRoot then return false end
+
+	-- Сравниваем дистанцию
+	return (myRoot.Position - enemyRoot.Position).Magnitude <= self.Range
+end
+
+function AutoBlock:ClearPlayerConnections(player)
+	if self.PlayerConnections[player] then
+		for _, conn in ipairs(self.PlayerConnections[player]) do
+			pcall(function() conn:Disconnect() end)
+		end
+		self.PlayerConnections[player] = nil
+	end
+end
+
+function AutoBlock:HookPlayer(player)
+	if player == LocalPlayer then return end
+
+	local function onCharacter(char)
+		if not char then return end
+
+		-- Очищаем старые соединения перед созданием новых
+		self:ClearPlayerConnections(player)
+		self.PlayerConnections[player] = {}
+		local conns = self.PlayerConnections[player]
+
+		-- 1. Реакция на анимации (Самый надежный метод)
+		local hum = char:WaitForChild("Humanoid", 5)
+		if hum then
+			local animConn = hum.AnimationPlayed:Connect(function(track)
+				if not self.Enabled then return end
+				local id = track.Animation and track.Animation.AnimationId or ""
+
+				-- Проверка на ID ударов
+				if id:find("5641749824") or id:find("5641750089") or id:find("5641750537") or
+				   id:find("5641750840") or id:find("4849281817") or id:find("4849282031") or
+				   id:find("4849282189") or id:find("4849282367") then
+
+					if self:IsInRange(char) then
+						self:Block()
+					end
+				end
+			end)
+			table.insert(conns, animConn)
+		end
+
+		-- 2. Реакция на BodyEffects.Attacking
+		local be = char:WaitForChild("BodyEffects", 5)
+		if be then
+			local attacking = be:WaitForChild("Attacking", 3)
+			if attacking then
+				local attConn = attacking.Changed:Connect(function(val)
+					if not self.Enabled then return end
+					if val == true and self:IsInRange(char) then
+						self:Block()
+					end
+				end)
+				table.insert(conns, attConn)
+			end
+		end
+
+		-- 3. Реакция на звуки (Оптимизировано: ищем только в HumanoidRootPart и руках)
+		local partsToListen = {"HumanoidRootPart", "RightHand", "RightArm"}
+		for _, partName in ipairs(partsToListen) do
+			local part = char:WaitForChild(partName, 3)
+			if part then
+				local soundConn = part.ChildAdded:Connect(function(child)
+					if not self.Enabled then return end
+					if child:IsA("Sound") then
+						local id = child.SoundId or ""
+						local name = child.Name:lower()
+
+						if id:find("5642044254") or id:find("5642043981") or id:find("4834063974") or
+						   id:find("4834064082") or id:find("5641749824") or
+						   name:find("swing") or name:find("swoosh") or name:find("punch") or
+						   name:find("hit") or name:find("slash") then
+
+							if self:IsInRange(char) then
+								self:Block()
+							end
+						end
+					end
+				end)
+				table.insert(conns, soundConn)
+			end
+		end
+	end
+
+	if player.Character then
+		task.spawn(onCharacter, player.Character)
+	end
+
+	local charAddedConn = player.CharacterAdded:Connect(onCharacter)
+
+	-- Сохраняем глобальное событие возрождения игрока
+	if not self.PlayerConnections[player] then self.PlayerConnections[player] = {} end
+	table.insert(self.PlayerConnections[player], charAddedConn)
+end
+
+function AutoBlock:Start()
+	if self.Enabled then return end
+	self.Enabled = true
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		self:HookPlayer(player)
+	end
+
+	local addConn = Players.PlayerAdded:Connect(function(player)
+		self:HookPlayer(player)
+	end)
+	table.insert(self.GlobalConnections, addConn)
+
+	local removeConn = Players.PlayerRemoving:Connect(function(player)
+		self:ClearPlayerConnections(player)
+	end)
+	table.insert(self.GlobalConnections, removeConn)
+
+	local unblockConn = RunService.Heartbeat:Connect(function()
+		if not self.Enabled then return end
+		if self.IsBlocking then
+			if tick() - self.LastBlockTime > self.UnblockDelay then
+				self:Unblock()
+			end
+		end
+	end)
+	table.insert(self.GlobalConnections, unblockConn)
+
+	print("[AutoBlock] ON")
+end
+
+function AutoBlock:Stop()
+	self.Enabled = false
+	self:Unblock()
+
+	for _, conn in ipairs(self.GlobalConnections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	self.GlobalConnections = {}
+
+	for player, _ in pairs(self.PlayerConnections) do
+		self:ClearPlayerConnections(player)
+	end
+	self.PlayerConnections = {}
+
+	print("[AutoBlock] OFF")
+end
+
+-- Когда возрождается локальный игрок, мы просто сбрасываем статус блока
+LocalPlayer.CharacterAdded:Connect(function()
+	AutoBlock.IsBlocking = false
+end)
+
 function CharacterModule:EnableNoSlow()
 	if self.NoSlow.Connection then return end
 	local char = LocalPlayer.Character
@@ -3489,6 +3726,7 @@ function CharacterModule:CleanupAll()
 	self:DisableNoclip()
 	self:DisableAntiFling()
 	self:DisableAutoReload()
+	self:DisableAutoBlock()
 	self:DisableNoSlow()
 	self:DisableNoJumpCooldown()
 	self:StopFell()
@@ -3498,6 +3736,7 @@ function CharacterModule:RestartIfEnabled()
 	if self.Noclip.Enabled then self:EnableNoclip() end
 	if self.AntiFling.Enabled then self:EnableAntiFling() end
 	if self.AutoReload.Enabled then self:EnableAutoReload() end
+	if self.AutoBlock.Enabled then self:EnableAutoBlock() end
 	if self.NoSlow.Enabled then self:EnableNoSlow() end
 	if self.NoJumpCooldown.Enabled then self:EnableNoJumpCooldown() end
 	if self.InfiniteZoom.Enabled then self:EnableInfiniteZoom() end
@@ -5838,7 +6077,7 @@ local function UpdateSecurityExpiration(window)
 	end
 
 	if not expiry then
-		window:SetExpire("?")
+		window:SetExpire("Dev Build")
 		return
 	end
 
@@ -6339,6 +6578,64 @@ do
 		})
 	end
 
+	local MiscOptionsSection = Menus.Misc:AddSection({ Name = "Misc", Side = "left", ShowTitle = true, Height = 0 })
+
+	MiscOptionsSection:AddToggle({
+		Name = "Disable 3d Game Render",
+		Default = false,
+		Flag = "Disable3DRender",
+		Callback = function(v)
+			pcall(function()
+				Services.RunService:Set3dRenderingEnabled(not v)
+			end)
+		end
+	})
+
+	MiscOptionsSection:AddButton({
+		Name = "Reset Character",
+		Callback = function()
+			local char = LocalPlayer.Character
+			if char and char:FindFirstChild("Humanoid") then
+				char.Humanoid.Health = 0
+			end
+		end
+	})
+
+	MiscOptionsSection:AddButton({
+		Name = "Boost FPS",
+		Callback = function()
+			local lighting = game:GetService("Lighting")
+			lighting.GlobalShadows = false
+			lighting.FogEnd = 9e9
+			lighting.ShadowSoftness = 0
+
+			if sethiddenproperty then
+				pcall(function() sethiddenproperty(lighting, "Technology", Enum.Technology.Compatibility) end)
+			end
+
+			for _, desc in ipairs(workspace:GetDescendants()) do
+				if desc:IsA("BasePart") then
+					desc.Material = Enum.Material.Plastic
+					desc.Reflectance = 0
+				elseif desc:IsA("Decal") or desc:IsA("Texture") then
+					desc.Transparency = 1
+				elseif desc:IsA("ParticleEmitter") or desc:IsA("Trail") then
+					desc.Lifetime = NumberRange.new(0)
+				elseif desc:IsA("PostEffect") then
+					desc.Enabled = false
+				end
+			end
+
+			local ignored = workspace:FindFirstChild("Ignored")
+			if ignored and ignored:FindFirstChild("Drop") then
+				for _, drop in ipairs(ignored.Drop:GetChildren()) do
+					if drop.Name == "MoneyDrop" then continue end
+					drop:Destroy()
+				end
+			end
+		end
+	})
+
 	local CharSection = Menus.Misc:AddSection({ Name = "Character", Side = "right", ShowTitle = true, Height = 0 })
 
 	local noclipToggle = CharSection:AddToggle({ Name = "Noclip", Default = false, Option = true, Flag = "NoclipEnabled",
@@ -6383,6 +6680,21 @@ do
 			Flag = "AutoReloadEnabledKeybind",
 			OnTriggered = function(active)
 				autoReloadToggle:SetValue(active)
+			end
+		})
+	end
+	local autoBlockToggle = CharSection:AddToggle({ Name = "Auto Block", Default = false, Option = true, Flag = "AutoBlockEnabled",
+		Callback = function(v)
+			characterModule.AutoBlock.Enabled = v
+			if v then characterModule:EnableAutoBlock() else characterModule:DisableAutoBlock() end
+		end })
+	if autoBlockToggle.Option then
+		autoBlockToggle.Option:AddKeybind({
+			Name = "Keybind",
+			Mode = "Toggle",
+			Flag = "AutoBlockEnabledKeybind",
+			OnTriggered = function(active)
+				autoBlockToggle:SetValue(active)
 			end
 		})
 	end
@@ -6462,6 +6774,98 @@ do
 		})
 	end
 
+	local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+	local AntiFlash = {
+		Enabled = false,
+		Connections = {},
+		Loop = nil,
+	}
+
+	local BlockedNames = {
+		whiteScreen = true, -- Flashbang
+		PepperSpray = true, -- Перцовый спрей
+		SNOWBALLFRAME = true, -- Снежок
+	}
+
+	function AntiFlash:Start()
+		if self.Enabled then return end
+		self.Enabled = true
+
+		local mainScreen = PlayerGui:WaitForChild("MainScreenGui", 10)
+		if not mainScreen then
+			warn("[AntiFlash] MainScreenGui не найден")
+			self.Enabled = false
+			return
+		end
+
+		for name in pairs(BlockedNames) do
+			local obj = mainScreen:FindFirstChild(name)
+			if obj then obj:Destroy() end
+		end
+
+		local conn1 = mainScreen.ChildAdded:Connect(function(child)
+			if BlockedNames[child.Name] then
+				child:Destroy()
+			end
+		end)
+		table.insert(self.Connections, conn1)
+
+		local conn2 = mainScreen.DescendantAdded:Connect(function(desc)
+			if BlockedNames[desc.Name] then
+				task.defer(function()
+					if desc and desc.Parent then
+						desc:Destroy()
+					end
+				end)
+			end
+		end)
+		table.insert(self.Connections, conn2)
+
+		self.Loop = task.spawn(function()
+			while self.Enabled do
+				pcall(function()
+					local ms = PlayerGui:FindFirstChild("MainScreenGui")
+					if ms then
+						for name in pairs(BlockedNames) do
+							local obj = ms:FindFirstChild(name)
+							if obj then obj:Destroy() end
+						end
+					end
+				end)
+				task.wait(0.1)
+			end
+		end)
+
+		print("[AntiFlash] Включён")
+	end
+
+	function AntiFlash:Stop()
+		if not self.Enabled then return end
+		self.Enabled = false
+
+		for _, conn in ipairs(self.Connections) do
+			pcall(function() conn:Disconnect() end)
+		end
+		self.Connections = {}
+
+		if self.Loop then
+			pcall(function() task.cancel(self.Loop) end)
+			self.Loop = nil
+		end
+
+		print("[AntiFlash] Выключён")
+	end
+
+	LocalPlayer.CharacterAdded:Connect(function()
+		if AntiFlash.Enabled then
+			AntiFlash:Stop()
+			task.wait(1)
+			AntiFlash.Enabled = false
+			AntiFlash:Start()
+		end
+	end)
+
 	local DetectionsSection = Menus.Misc:AddSection({ Name = "Detections", Side = "right", ShowTitle = true, Height = 0 })
 
 	local rpgDetectionToggle = DetectionsSection:AddToggle({ Name = "RPG Detection", Default = false, Option = true, Flag = "RPGDetectionEnabled",
@@ -6500,6 +6904,24 @@ do
 			Flag = "GranadeDetectionEnabledKeybind",
 			OnTriggered = function(active)
 				granadeDetectionToggle:SetValue(active)
+			end
+		})
+	end
+	local flashDetectionToggle = DetectionsSection:AddToggle({ Name = "Anti Flash", Default = false, Option = true, Flag = "AntiFlashEnabled",
+		Callback = function(v)
+			if v then
+				AntiFlash:Start()
+			else
+				AntiFlash:Stop()
+			end
+		end })
+	if flashDetectionToggle.Option then
+		flashDetectionToggle.Option:AddKeybind({
+			Name = "Keybind",
+			Mode = "Toggle",
+			Flag = "AntiFlashEnabledKeybind",
+			OnTriggered = function(active)
+				flashDetectionToggle:SetValue(active)
 			end
 		})
 	end
