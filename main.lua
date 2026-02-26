@@ -6065,60 +6065,109 @@ local Window = Fatality.new({
 	Theme = ThemeConfig,
 })
 
-local function UpdateSecurityExpiration(window)
-	if not window then return end
-
-	-- PolSec устанавливает переменные напрямую в окружение скрипта
+-- Читает переменные PolSec из разных “глобальных” окружений (что доступно)
+local function ReadPolSecVars()
+	-- 1) Прямые globals (если PolSec кладёт прямо в окружение текущего скрипта)
 	local expiry   = PolSec_Expiry
 	local creation = PolSec_Creation
 	local userId   = PolSec_UserId
 	local note     = PolSec_Note
 
-	-- Fallback: пробуем getgenv() / _G на случай если переменные там
-	if not expiry and not creation then
-		local env = getgenv and getgenv() or _G
-		expiry   = env.PolSec_Expiry
-		creation = env.PolSec_Creation
-		userId   = env.PolSec_UserId
-		note     = env.PolSec_Note
+	-- 2) getgenv() (часто в executor-окружениях)
+	if getgenv then
+		local ok, genv = pcall(getgenv)
+		if ok and type(genv) == "table" then
+			expiry   = expiry   or genv.PolSec_Expiry
+			creation = creation or genv.PolSec_Creation
+			userId   = userId   or genv.PolSec_UserId
+			note     = note     or genv.PolSec_Note
+		end
 	end
 
-	if not expiry then
-		window:SetExpire("???")
-		return
+	-- 3) _G (fallback)
+	expiry   = expiry   or _G.PolSec_Expiry
+	creation = creation or _G.PolSec_Creation
+	userId   = userId   or _G.PolSec_UserId
+	note     = note     or _G.PolSec_Note
+
+	return expiry, creation, userId, note
+end
+
+-- Нормализует timestamp (если вдруг пришёл в миллисекундах)
+local function NormalizeUnixTimestamp(ts)
+	ts = tonumber(ts)
+	if not ts then return nil end
+
+	-- если внезапно миллисекунды (защита), приводим к секундам
+	if ts > 9999999999 then
+		ts = math.floor(ts / 1000)
 	end
 
-	expiry = tonumber(expiry)
+	return ts
+end
+
+-- Возвращает true если данные (expiry) реально найдены/обработаны, иначе false
+local function UpdateSecurityExpiration(window)
+	if not window then return false end
+
+	local expiry, creation, userId, note = ReadPolSecVars()
+
+	if expiry == nil then
+		-- переменные ещё не появились
+		window:SetExpire("Loading...")
+		return false
+	end
+
+	expiry = NormalizeUnixTimestamp(expiry)
 	if not expiry then
 		window:SetExpire("Unknown")
-		return
+		return true
 	end
 
-	-- expiry == 0 или дата дальше 2100-01-01 — lifetime
-	if expiry == 0 or expiry > 4102444800 then
+	-- По доке: unix time (UTC). Lifetime в доке не описан,
+	-- но если у тебя подтверждено что 0 = lifetime, оставляем это.
+	if expiry == 0 then
 		window:SetExpire("Lifetime")
 	else
-		-- Корректируем если timestamp в миллисекундах
-		if expiry > 9999999999 then
-			expiry = math.floor(expiry / 1000)
-		end
-		window:SetExpire(os.date("%d.%m.%Y", expiry))
+		-- UTC-формат. Если хочешь локальное время, убери "!".
+		window:SetExpire(os.date("!%d.%m.%Y", expiry))
 	end
 
-	-- Username: PolSec даёт только Discord UserId, имя берём из Note
+	-- Username: PolSec даёт Discord UserId; note по доке nil по умолчанию
 	userId = tonumber(userId)
 	if userId and userId > 1 then
-		if note and note ~= "" then
-			window:SetUsername(tostring(note))
+		if type(note) == "string" and note ~= "" then
+			window:SetUsername(note)
 		else
 			window:SetUsername("ID: " .. tostring(userId))
 		end
+	else
+		-- опционально: можно показать что это trial/не привязан Discord
+		-- window:SetUsername("Trial / Not linked")
 	end
+
+	return true
 end
 
-pcall(function()
-	UpdateSecurityExpiration(Window)
-end)
+-- Вызывай это после создания Window
+local function StartPolSecUiUpdater(window)
+	task.spawn(function()
+		local maxAttempts = 20
+		local delayBetween = 0.5
+
+		for _ = 1, maxAttempts do
+			if UpdateSecurityExpiration(window) then
+				return
+			end
+			task.wait(delayBetween)
+		end
+
+		-- так и не появилось
+		window:SetExpire("???")
+	end)
+end
+
+StartPolSecUiUpdater(Window)
 
 if Window and Window.Signal then
 	Window.Signal.Event:Connect(function(isVisible)
